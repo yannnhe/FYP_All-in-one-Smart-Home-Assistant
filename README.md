@@ -2,6 +2,6 @@
 
 This is the repo for Group TF04a-25 Final Year Project, ESPHome part.
 
-`/ESP32` contain the PlatformIO project file for the esp32 development board.
+`/Main` contain the yaml file for the ESP32-S3-N16R8 development board.
 
-`/Doorlock` contain file related to the 3D-model for this project.
+`/Doorlock` contain the yaml file used for the smart doorlock system.
