@@ -1,0 +1,109 @@
+esphome:
+  name: esp32-cam
+  friendly_name: ESP32-Cam
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+psram:
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "tGNOv9yS55fykt11Cv9qnRhs8hxCK4QJB56GbnErLp0="
+
+ota:
+  - platform: esphome
+    password: "ccc04cdeffb52d73657923f45fecd846"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Esp32-Cam Fallback Hotspot"
+    password: "uloBcFDD64Gf"
+
+captive_portal:
+    
+i2c:
+
+  - id: camera_i2c
+    sda: GPIO26
+    scl: GPIO27
+
+esp32_camera:
+
+  external_clock:
+    pin: GPIO0
+    frequency: 20MHz
+  i2c_id: camera_i2c
+  data_pins: [GPIO5, GPIO18, GPIO19, GPIO21, GPIO36, GPIO39, GPIO34, GPIO35]
+  vsync_pin: GPIO25
+  href_pin: GPIO23
+  pixel_clock_pin: GPIO22
+
+  # Image settings
+  name: My Camera
+  max_framerate: 30 fps    # default: 10 fps, max 60
+  idle_framerate: 0.2 fps  # default: 0.1 fps - framerate for 'picture' in HA dashboard
+  resolution: 1024x768
+  jpeg_quality: 10
+  vertical_flip: True
+  horizontal_mirror: True
+  contrast: 0 # default: 0, variable -2 to 2
+  brightness: 0 # default: 0, variable -2 to 2
+  saturation: 0 # default: 0, variable -2 to 2
+
+esp32_camera_web_server:
+
+  - port: 8080
+    mode: stream
+  - port: 8081
+    mode: snapshot
+  
+output:
+
+  - platform: gpio
+    pin: GPIO4
+    id: gpio_4
+
+light:
+
+  - platform: binary
+    output: gpio_4
+    name: Flashlight
+    id: flash_light
+
+button:
+  
+  - platform: restart
+    name: "Doorlock Cam Restart"
+    internal: true
+    id: restart_cam
+
+sensor:
+
+  - platform: wifi_signal
+    name: "ESP32-Cam wifi signal"
+    update_interval: 30s
+
+switch:
+
+  - platform: gpio
+    name: 'Doorlock Cam Restart(ing)'
+    id: power_down
+    pin: GPIO32
+    on_turn_off:
+      then:
+        - light.turn_off: flash_light
+    on_turn_on:
+      then:
+        - delay: 5s
+        - button.press: restart_cam

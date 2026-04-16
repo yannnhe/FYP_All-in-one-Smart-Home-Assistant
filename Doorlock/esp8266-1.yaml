@@ -1,0 +1,250 @@
+esphome:
+
+  name: esp8266-1
+  friendly_name: ESP8266-1
+
+esp8266:
+
+  board: nodemcuv2
+
+# Enable logging
+logger:
+
+  level: DEBUG
+
+# Enable Home Assistant API
+api:
+
+  encryption:
+    key: "pbLu04hT/LjekupStyR48tEsOF8m8WPfK0cLzelm2mY="
+
+ota:
+
+  - platform: esphome
+    password: "db275fce523e84b94ab74f8ad7792430"
+
+wifi:
+  
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Esp8266-1 Fallback Hotspot"
+    password: "myVQGIWnXSIn"
+
+captive_portal:
+    
+matrix_keypad:
+
+  id: mykeypad
+  rows:
+    - pin: D3
+    - pin: D2
+    - pin: D1
+    - pin: D0
+  columns:
+    - pin: D7
+    - pin: D6
+    - pin: D5
+    - pin: D4
+  keys: "123A456B789C*0#D"
+  has_diodes: false
+  on_key:
+    - lambda: |-
+    
+        char key = x;
+
+        // If keypad is disabled, only allow doorbell B
+        if (!id(enable_keypad_switch).state && key != 'B') {
+          id(keypad_disabled_pulse).execute();
+          return;
+        }
+
+        // Start key A
+        if (key == 'A') {
+          // Enter input mode
+          id(input_active) = true;
+          id(pin_input) = "";
+          id(input_display_sensor).publish_state("");
+          
+          // Start timeout timer
+          id(input_timeout_script).execute();
+          ESP_LOGI("keypad", "Input started");
+          return;
+        }
+
+        // If not in input mode, ignore
+        if (!id(input_active)) return;
+
+        // Clear key C
+        if (key == 'C') {
+          id(pin_input) = "";
+          id(input_display_sensor).publish_state("");
+          id(input_timeout_script).execute();
+          ESP_LOGD("keypad", "Input cleared");
+          return;
+        }
+
+        // Back key *
+        if (key == '*') {
+          if (!id(pin_input).empty()) {
+            id(pin_input).pop_back();
+            id(input_display_sensor).publish_state(id(pin_input));
+          }
+          id(input_timeout_script).execute(); // Reset timeout
+          return;
+        }
+
+        // Enter key #
+        if (key == '#') {
+          // Cancel timeout
+          id(input_timeout_script).stop();
+          
+          // Check length
+          if (id(pin_input).length() == 4) {
+            std::string password = id(pin_input);
+            if (password == "1234") { // Valid password
+              id(access_granted_pulse).execute();
+              ESP_LOGI("keypad", "Access granted: %s", password.c_str());
+            } else {
+              id(access_denied_pulse).execute();
+              ESP_LOGI("keypad", "Access denied: %s", password.c_str());
+            }
+          } else {
+            id(access_denied_pulse).execute();
+            ESP_LOGI("keypad", "Incomplete password (length %d)", id(pin_input).length());
+          }
+          
+          // Cancel input mode
+          id(input_active) = false;
+          id(pin_input) = "";
+          id(input_display_sensor).publish_state("");
+          return;
+        }
+
+        // Number key 0-9
+        if (key >= '0' && key <= '9') {
+          
+          // Slide window
+          if (id(pin_input).length() >= 4) {
+            id(pin_input) = id(pin_input).substr(1) + std::string(1, key);
+          } else {
+            id(pin_input) += key;
+          }
+          id(input_display_sensor).publish_state(id(pin_input));
+          id(input_timeout_script).execute(); // Reset timeout
+          return;
+        }
+
+globals:
+
+  - id: pin_input
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: input_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+sensor:
+
+  - platform: wifi_signal
+    name: "ESP8266-1 wifi signal"
+    update_interval: 30s
+
+binary_sensor:
+
+  - platform: matrix_keypad
+    id: keyB
+    name: "Doorbell - Keypad"
+    key: B
+  - platform: template
+    id: access_granted_keypad
+    name: "Access Granted - Keypad"
+  - platform: template
+    id: access_denied_keypad
+    name: "Access Denied - Keypad"
+  - platform: template
+    id: keypad_disabled_event
+    name: "Keypad Disabled Event"
+
+text_sensor:
+
+  - platform: template
+    id: input_display_sensor
+    name: "Keypad Input Display"
+    update_interval: never
+    lambda: |-
+
+      if (id(input_active)) return id(pin_input);
+      else return {};  
+
+switch:
+
+  - platform: template
+    name: "Enable Keypad Input"
+    id: enable_keypad_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_off:
+      then:
+        - lambda: |-
+
+            if (id(input_active)) {
+              id(input_active) = false;
+              id(pin_input) = "";
+              id(input_display_sensor).publish_state("");
+              id(input_timeout_script).stop();
+              ESP_LOGI("keypad", "Input cancelled because keypad disabled");
+            }
+
+script:
+
+  - id: input_timeout_script
+    mode: restart
+    then:
+      - delay: 5s
+      - lambda: |-
+      
+          if (id(input_active)) {
+            ESP_LOGI("keypad", "Input timeout");
+            id(input_active) = false;
+            id(pin_input) = "";
+            id(input_display_sensor).publish_state("");
+            id(access_denied_pulse).execute();
+          }
+
+  - id: access_granted_pulse
+    mode: restart
+    then:
+      - binary_sensor.template.publish:
+          id: access_granted_keypad
+          state: ON
+      - delay: 1s
+      - binary_sensor.template.publish:
+          id: access_granted_keypad
+          state: OFF
+
+  - id: access_denied_pulse
+    mode: restart
+    then:
+      - binary_sensor.template.publish:
+          id: access_denied_keypad
+          state: ON
+      - delay: 1s
+      - binary_sensor.template.publish:
+          id: access_denied_keypad
+          state: OFF
+  
+  - id: keypad_disabled_pulse
+    mode: restart
+    then:
+      - binary_sensor.template.publish:
+          id: keypad_disabled_event
+          state: ON
+      - delay: 1s
+      - binary_sensor.template.publish:
+          id: keypad_disabled_event
+          state: OFF

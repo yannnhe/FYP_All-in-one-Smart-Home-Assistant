@@ -1,0 +1,757 @@
+esphome:
+  name: esp32-1
+  friendly_name: ESP32-1
+  on_boot:
+    priority: -100
+    then:
+
+      # 1) Enter safe state to prevent high loads
+      - light.turn_off: home_mode_indicator
+      - light.turn_off: ws2812_living_room
+      - switch.turn_off: fan_kitchen_switch
+      - switch.turn_off: fan_bedroom_switch
+      - switch.turn_off: buzzer_kitchen_switch
+
+      # 2) The mode indicator first displays the “Starting” status: dim white
+      - light.turn_on:
+        
+          id: home_mode_indicator
+          red: 100%
+          green: 100%
+          blue: 100%
+          brightness: 10%
+          effect: none
+
+      # 3) Wait for hardware stabilization
+      - delay: 1000ms
+
+      # 4) Restore door/window positions based on the last saved settings
+      - if:
+          condition:
+            lambda: 'return id(doorlock_door_open);'
+          then:
+            - servo.write:
+                id: doorlock_door_servo
+                level: -1
+          else:
+            - servo.write:
+                id: doorlock_door_servo
+                level: 0.2
+
+      - if:
+          condition:
+            lambda: 'return id(balcony_window_open);'
+          then:
+            - servo.write:
+                id: balcony_window_servo
+                level: 1
+          else:
+            - servo.write:
+                id: balcony_window_servo
+                level: 0
+
+      # 5) Wait for Home Assistant to sync statuses before updating the mode indicator color
+      - delay: 5s
+      - lambda: |-
+
+          auto mode = id(ha_home_mode).state;
+
+          if (mode == "home") {
+            auto call = id(home_mode_indicator).turn_on();
+            call.set_effect("None");
+            call.set_brightness(0.50);
+            call.set_rgb(0.0, 1.0, 0.0);  // Green
+            call.perform();
+
+          } else if (mode == "away") {
+            auto call = id(home_mode_indicator).turn_on();
+            call.set_effect("None");
+            call.set_brightness(0.50);
+            call.set_rgb(0.0, 0.0, 1.0);  // Blue
+            call.perform();
+
+          } else if (mode == "sleep") {
+            auto call = id(home_mode_indicator).turn_on();
+            call.set_effect("None");
+            call.set_brightness(0.30);
+            call.set_rgb(0.6, 0.0, 0.8);  // Purple
+            call.perform();
+
+          } else if (mode == "emergency") {
+            auto call = id(home_mode_indicator).turn_on();
+            call.set_brightness(1.0);
+            call.set_rgb(1.0, 0.0, 0.0);  // Red
+            call.set_effect("Emergency Pulse");
+            call.perform();
+
+          } else {
+            auto call = id(home_mode_indicator).turn_on();
+            call.set_effect("None");
+            call.set_brightness(0.15);
+            call.set_rgb(1.0, 1.0, 1.0);  // White
+            call.perform();
+          }
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "+KAwsUu0AIozavYSIKFPlURLFzZRROyFT1epGsp4NjY="
+
+ota:
+  - platform: esphome
+    password: "748c0873b519f4eaf474d0fb5ed4e64a"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Esp32-1 Fallback Hotspot"
+    password: "ErGGWFwzMCYU"
+
+captive_portal:
+
+globals:
+
+  # Store door position
+  - id: doorlock_door_open
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+
+  # Store window position
+  - id: balcony_window_open
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+
+  # Store last knob brightness
+  - id: last_knob_brightness
+    type: float
+    restore_value: no
+    initial_value: '-1.0'
+
+  # Store last knob percentage
+  - id: last_knob_percent
+    type: float
+    restore_value: no
+    initial_value: '-1.0'
+
+sensor:
+
+  # Living Room LED Knob
+  - platform: adc
+    pin: 1
+    name: "Knob ADC voltage"
+    update_interval: 0.2s
+    id: "knob_source"
+    accuracy_decimals: 3
+    attenuation: 12db
+    filters:
+      - median:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+
+  # Rotation knob index conversion
+  - platform: template
+    name: "LED Intensity Index - Living Room"
+    update_interval: 0.2s
+    accuracy_decimals: 0
+    unit_of_measurement: "%"
+    icon: "mdi:ceiling-light" 
+    lambda: |-
+
+      // Reference voltages at extreme conditions
+      const float bright = 3.157;
+      const float dark = 0.100;
+
+      // Read ADC Voltage (V)
+      float v = id(knob_source).state;
+
+      // Conversion to percentages
+      float index = (v - dark) / (bright - dark) * 100.0;
+
+      // Limitations
+      if (index < 0.0) index = 0.0;
+      if (index > 100.0) index = 100.0;
+      return index;
+
+    on_value:
+      then:
+        - lambda: |-
+            
+            float knob_percent = x;
+
+            // First reading after startup: Only records the current knob position; does not control the light
+            if (id(last_knob_percent) < 0.0) {
+              id(last_knob_percent) = knob_percent;
+              id(last_knob_brightness) = knob_percent / 100.0;
+              return;
+            }
+            
+            // Changes of less than 5% are considered noise and are ignored
+            float knob_delta = fabs(knob_percent - id(last_knob_percent));
+            if (knob_delta < 5.0) return;
+
+            // Record the current knob value
+            id(last_knob_percent) = knob_percent;
+            float new_brightness = knob_percent / 100.0;
+
+            // Prevent repeated writing of values with similar brightness levels
+            if (fabs(new_brightness - id(last_knob_brightness)) < 0.03) return;
+
+            id(last_knob_brightness) = new_brightness;
+
+            if (new_brightness <= 0.01) {
+              auto call = id(ws2812_living_room).turn_off();
+              call.perform();
+            } else {
+              auto call = id(ws2812_living_room).turn_on();
+              call.set_brightness(new_brightness);
+              call.perform();
+            }
+
+  # MQ2 Flammable Gas Sensor
+  - platform: adc
+    pin: 2
+    name: "MQ2 ADC voltage"
+    update_interval: 5s
+    id: "flammable_gas_source"
+    accuracy_decimals: 3
+    attenuation: 12db
+    internal: true
+
+  # MQ2 PPM conversion
+  - platform: template
+    name: "Flammable Gas - Kitchen"
+    update_interval: 5s
+    accuracy_decimals: 0
+    unit_of_measurement: "ppm"
+    icon: "mdi:fire-circle" 
+    lambda: |-
+      
+      // Read ADC Voltage (V)
+      float voltage = id(flammable_gas_source).state;
+
+      // Circuit parameters   
+      const float Vcc = 5.0; // Supply voltage
+      const float RL = 0.5; // Load resistance (500 ohm)
+      const float R0 = 6.64; // Sensor resistance (kΩ) in calibrated clean air
+
+      float RS = (Vcc - voltage) / (voltage / RL); // Calculate the sensor resistance RS
+      
+      float ppm = pow(11.5428 * R0 / RS, 0.6549f); // Calculate PPM (using the exponential relationship)
+      if (ppm < 0) ppm = 0;
+      return ppm;
+
+  # GUVA-S12SD UV sensor
+  - platform: adc
+    pin: 4
+    name: "GUVA-S12SD ADC voltage"
+    update_interval: 5s
+    id: "uv_index_source"
+    accuracy_decimals: 3
+    samples: 10
+    sampling_mode: avg
+    internal: true
+
+  # UV index conversion
+  - platform: template
+    name: "UV index - Balcony"
+    update_interval: 5s
+    accuracy_decimals: 0
+    unit_of_measurement: ""
+    icon: "mdi:sun-wireless"
+    lambda: |-
+
+      // Non-linear relationship
+      if (id(uv_index_source).state < 0.05) return 0;
+      if (id(uv_index_source).state <= 0.227) return 1;
+      if (id(uv_index_source).state <= 0.318) return 2;
+      if (id(uv_index_source).state <= 0.408) return 3;
+      if (id(uv_index_source).state <= 0.503) return 4;
+      if (id(uv_index_source).state <= 0.606) return 5;
+      if (id(uv_index_source).state <= 0.696) return 6;
+      if (id(uv_index_source).state <= 0.795) return 7;
+      if (id(uv_index_source).state <= 0.881) return 8;
+      if (id(uv_index_source).state <= 0.976) return 9;
+      return 10;
+
+  # MQ135 Air Quality Sensor
+  - platform: adc
+    pin: 5
+    name: "MQ135 ADC voltage"
+    update_interval: 5s
+    id: "air_quality_source"
+    accuracy_decimals: 3
+    attenuation: 12db
+    internal: true
+
+  # MQ135 PPM conversion
+  - platform: template
+    name: "Air Quality - Balcony"
+    update_interval: 5s
+    accuracy_decimals: 0
+    unit_of_measurement: "ppm"
+    icon: "mdi:air-filter" 
+    lambda: |-
+      
+      // Read ADC Voltage (V)
+      float voltage = id(air_quality_source).state;  
+
+      // Circuit parameters   
+      const float Vcc = 5.0; // Supply voltage
+      const float RL = 0.5; // Load resistance (500 ohm)
+      const float R0 = 6.64; // Sensor resistance (kΩ) in calibrated clean air
+
+      float RS = (Vcc - voltage) / (voltage / RL); // Calculate the sensor resistance RS
+      
+      float ppm = pow(11.5428 * R0 / RS, 0.6549f); // Calculate PPM (using the exponential relationship)
+      if (ppm < 0) ppm = 0;
+      return ppm;
+
+  # Light intensity sensor
+  - platform: adc
+    pin: 6
+    name: "Light intensity sensor ADC voltage"
+    update_interval: 5s
+    id: "light_intensity_source"
+    accuracy_decimals: 3
+    attenuation: 12db
+    internal: true
+
+  # Light intensity sensor LUX conversion
+  - platform: template
+    name: "Light intensity - Balcony"
+    update_interval: 5s
+    accuracy_decimals: 0
+    unit_of_measurement: "lux"
+    icon: "mdi:weather-sunny" 
+    lambda: |-
+
+      // Read ADC Voltage (V)
+      float voltage = id(light_intensity_source).state;
+      
+      // Circuit parameters
+      const float V_ref = 3.3; // Reference voltage
+      const float R_fixed = 10000.0;  // Voltage-dividing resistor of 10 kΩ
+      
+      // Prevent division by zero when the voltage approaches the reference voltage
+      if (voltage >= V_ref - 0.01) return 999;
+      
+      // Calculating the resistance of a photoresistor
+      float R_ldr = voltage / (V_ref - voltage) * R_fixed;
+      
+      // Calculate illuminance using an empirical formula
+      float lux = 40000.0 * pow(R_ldr, -0.6021);
+      
+      // Limitations
+      if (lux > 999.0) lux = 999.0;
+      if (lux < 0.0) lux = 0.0;
+      return lux;
+    
+  # Rain sensor
+  - platform: adc
+    pin: 7
+    name: "Rain sensor ADC voltage"
+    update_interval: 5s
+    id: "rain_sensor_source"
+    accuracy_decimals: 3
+    attenuation: 12db
+    internal: true
+
+  # Rain sensor index conversion
+  - platform: template
+    name: "Rain Index - Balcony"
+    update_interval: 5s
+    accuracy_decimals: 0
+    unit_of_measurement: "%"
+    icon: "mdi:weather-rainy" 
+    lambda: |-
+
+      // Reference voltages at extreme conditions
+      const float dry = 3.157;
+      const float wet = 1.500;
+
+      // Read ADC Voltage (V)
+      float v = id(rain_sensor_source).state;
+
+      // Conversion to percentages
+      float index = (dry - v) / (dry - wet) * 100.0;
+
+      // Limitations
+      if (index < 0.0) index = 0.0;
+      if (index > 100.0) index = 100.0;
+      return index;
+
+  # DHT11 - Living Room
+  - platform: dht
+    pin: 13
+    temperature:
+      name: "Temperature - Living Room"
+    humidity:
+      name: "Humidity - Living Room"
+    update_interval: 5s
+
+  # DHT11 - Balcony
+  - platform: dht
+    pin: 15
+    temperature:
+      name: "Temperature - Balcony"
+    humidity:
+      name: "Humidity - Balcony"
+    update_interval: 5s
+
+  # DHT11 - Bedroom
+  - platform: dht
+    pin: 16
+    temperature:
+      name: "Temperature - Bedroom"
+    humidity:
+      name: "Humidity - Bedroom"
+    update_interval: 5s
+
+  # Kitchen water level sensor
+  - platform: adc
+    pin: 8
+    name: "Kitchen water level sensor ADC voltage"
+    update_interval: 5s
+    id: "water_level_source"
+    accuracy_decimals: 3
+    attenuation: 12db
+    internal: true
+
+  # Kitchen water level sensor index conversion
+  - platform: template
+    name: "Water Level - Kitchen"
+    update_interval: 5s
+    accuracy_decimals: 0
+    unit_of_measurement: "%"
+    # icon: "" 
+    lambda: |-
+
+      // Reference voltages at extreme conditions
+      const float high = 3.157;
+      const float low = 0.100;
+
+      // Read ADC Voltage (V)
+      float v = id(water_level_source).state;
+
+      // Conversion to percentages
+      float index = (v - low) / (high - low) * 100.0;
+
+      // Limitations
+      if (index < 0.0) index = 0.0;
+      if (index > 100.0) index = 100.0;
+      return index;
+
+  # Wifi signal strength
+  - platform: wifi_signal
+    name: "ESP32-1 wifi signal"
+    update_interval: 30s
+
+binary_sensor:
+  
+  - platform: gpio
+    pin:
+      number: 14
+      mode:
+        input: true
+    name: "LED Button Switch - Living Room"
+    internal: true
+    on_press:
+      - light.toggle: ws2812_living_room
+
+  - platform: gpio
+    pin:
+      number: 19
+      mode:
+        input: true
+      inverted: true
+    name: "Fire Sensor - Kitchen"
+
+  - platform: gpio
+    pin:
+      number: 35
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "At Home Mode - Button Selection"
+    internal: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      - homeassistant.action:
+          action: input_select.select_option
+          data:
+            entity_id: input_select.home_modes
+            option: home
+
+  - platform: gpio
+    pin:
+      number: 36
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Away Mode - Button Selection"
+    internal: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      - homeassistant.action:
+          action: input_select.select_option
+          data:
+            entity_id: input_select.home_modes
+            option: away
+
+  - platform: gpio
+    pin:
+      number: 37
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Emergency Mode - Button Selection"
+    internal: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      - homeassistant.action:
+          action: input_select.select_option
+          data:
+            entity_id: input_select.home_modes
+            option: emergency
+
+  - platform: gpio
+    pin:
+      number: 38
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Sleep Mode - Button Selection"
+    internal: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      - homeassistant.action:
+          action: input_select.select_option
+          data:
+            entity_id: input_select.home_modes
+            option: sleep
+
+output:
+
+  - platform: ledc
+    pin: 39
+    id: rgb_red
+    frequency: 1000Hz
+
+  - platform: ledc
+    pin: 40
+    id: rgb_green
+    frequency: 1000Hz
+
+  - platform: ledc
+    pin: 41
+    id: rgb_blue
+    frequency: 1000Hz
+
+  # Buzzer
+  - platform: gpio
+    pin: 42
+    id: buzzer_kitchen_output
+    inverted: true
+
+  # Doorlock door
+  - platform: ledc
+    pin: 47
+    id: doorlock_door_pwm
+    frequency: 50Hz
+
+  # Balcony window
+  - platform: ledc
+    pin: 48
+    id: balcony_window_pwm
+    frequency: 50Hz
+
+text_sensor:
+  
+  - platform: homeassistant
+    id: ha_home_mode
+    entity_id: input_select.home_modes
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+
+            auto mode = id(ha_home_mode).state;
+
+            if (mode == "home") {
+              auto call = id(home_mode_indicator).turn_on();
+              call.set_effect("None");
+              call.set_brightness(0.50);
+              call.set_rgb(0.0, 1.0, 0.0);  // Green
+              call.perform();
+
+            } else if (mode == "away") {
+              auto call = id(home_mode_indicator).turn_on();
+              call.set_effect("None");
+              call.set_brightness(0.50);
+              call.set_rgb(0.0, 0.0, 1.0);  // Blue
+              call.perform();
+
+            } else if (mode == "sleep") {
+              auto call = id(home_mode_indicator).turn_on();
+              call.set_effect("None");
+              call.set_brightness(0.30);
+              call.set_rgb(0.6, 0.0, 0.8);  // Purple
+              call.perform();
+
+            } else if (mode == "emergency") {
+              auto call = id(home_mode_indicator).turn_on();
+              call.set_brightness(1.0);
+              call.set_rgb(1.0, 0.0, 0.0);  // Red
+              call.set_effect("Emergency Pulse");
+              call.perform();
+
+            } else {
+              auto call = id(home_mode_indicator).turn_on();
+              call.set_effect("None");
+              call.set_brightness(0.15);
+              call.set_rgb(1.0, 1.0, 1.0);  // White
+              call.perform();
+            }
+
+servo:
+
+  - id: doorlock_door_servo
+    output: doorlock_door_pwm
+    auto_detach_time: 1s
+    transition_length: 1s
+
+  - id: balcony_window_servo
+    output: balcony_window_pwm
+    min_level: 2.5%
+    idle_level: 7.5%
+    max_level: 12.5%
+    auto_detach_time: 1s
+    transition_length: 1s
+
+switch:
+
+  - platform: output
+    name: "Buzzer - Kitchen"
+    output: buzzer_kitchen_output
+    id: buzzer_kitchen_switch
+
+  - platform: gpio
+    name: "Fan Switch - Bedroom"
+    pin: 12
+    id: fan_bedroom_switch
+
+  - platform: gpio
+    name: "Fan Switch - Kitchen"
+    pin: 21
+    id: fan_kitchen_switch
+
+  - platform: template
+    name: "Doorlock Door"
+    id: doorlock_door_switch
+    lambda: |-
+      return id(doorlock_door_open);
+    turn_on_action:
+      - servo.write:
+          id: doorlock_door_servo
+          level: -1
+      - delay: 1s
+      - lambda: |-
+          id(doorlock_door_open) = true;
+    turn_off_action:
+      - servo.write:
+          id: doorlock_door_servo
+          level: 0.2
+      - delay: 1s
+      - lambda: |-
+          id(doorlock_door_open) = false;
+
+  - platform: template
+    name: "Balcony Window"
+    id: balcony_window_switch
+    lambda: |-
+      return id(balcony_window_open);
+    turn_on_action:
+      - servo.write:
+          id: balcony_window_servo
+          level: 1
+      - delay: 1s
+      - lambda: |-
+          id(balcony_window_open) = true;
+    turn_off_action:
+      - servo.write:
+          id: balcony_window_servo
+          level: 0
+      - delay: 1s
+      - lambda: |-
+          id(balcony_window_open) = false;
+
+time:
+
+  - platform: homeassistant
+    id: homeassistant_time
+
+display:
+
+  platform: tm1637
+  clk_pin: 18
+  dio_pin: 17
+  update_interval: 500ms
+  lambda: |-
+
+      static int i = 0;
+      i++;
+      if ((i % 2) == 0)
+        it.strftime("%H.%M", id(homeassistant_time).now());
+      else
+        it.strftime("%H%M", id(homeassistant_time).now());
+
+light:
+
+  - platform: esp32_rmt_led_strip
+    id: ws2812_living_room
+    rgb_order: GRB
+    pin: 11
+    num_leds: 43
+    chipset: ws2812
+    name: "WS2812B Light - Living Room"
+  
+  - platform: rgb
+    name: "Home Mode Indicator"
+    id: home_mode_indicator
+    red: rgb_red
+    green: rgb_green
+    blue: rgb_blue
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+    effects:
+      - pulse:
+          name: "Emergency Pulse"
+          transition_length: 500ms
+          update_interval: 500ms
+    internal: True
